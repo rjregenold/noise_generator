@@ -1,2 +1,2 @@
 [target.arm-unknown-linux-gnueabihf]
-image = "my/white_noise:0.0.1"
+image = "rjregenold/cross:arm-rpi-4.9.3-linux-gnueabihf"

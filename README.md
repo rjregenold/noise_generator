@@ -1,6 +1,11 @@
-* install gnu toolchain
-  * this page was very helpful:
-    https://chacin.dev/blog/cross-compiling-rust-for-the-raspberry-pi/
-* install portaudio on the raspberry pi
+# White Noise Generator for Raspberry Pi Zero
 
-$ sudo apt-get install libportaudio2
+This repository contains the code to create a white noise generator using a Raspberry Pi Zero.
+
+## Building
+
+You will need Docker and Rust Cross installed. Then you can cross-compile the application for the Raspberry Pi Zero.
+
+```
+$ ./build-rpi0.sh
+```
