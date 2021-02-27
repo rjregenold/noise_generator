@@ -1,8 +1,8 @@
 extern crate portaudio;
 
-use std::io;
-use std::time::{Instant};
 use portaudio as pa;
+use std::io;
+use std::time::Instant;
 
 const CHANNELS: i32 = 2;
 const SAMPLE_RATE: f64 = 44_100.0;
@@ -20,12 +20,17 @@ struct LGC {
     modulus: u64,
     a: u64,
     c: u64,
-    state: u64
+    state: u64,
 }
 
 impl LGC {
     fn new(seed: u64) -> LGC {
-        LGC { modulus: 4294967296, a: 1664525, c: 1013904223, state: seed }
+        LGC {
+            modulus: 4294967296,
+            a: 1664525,
+            c: 1013904223,
+            state: seed,
+        }
     }
 }
 
@@ -52,7 +57,10 @@ fn main() {
 
 fn next_sample(rng: &mut LGC) -> f32 {
     // scales the next pseudo-random number to a value between -1 and 1
-    return rng.next().map(|x| -1.0 + 2f32 * (x as f32) / (rng.modulus as f32)).unwrap_or(0f32);
+    return rng
+        .next()
+        .map(|x| -1.0 + 2f32 * (x as f32) / (rng.modulus as f32))
+        .unwrap_or(0f32);
 }
 
 fn run() -> Result<(), pa::Error> {
@@ -69,23 +77,24 @@ fn run() -> Result<(), pa::Error> {
     // 100ms latency
     let latency = 0.1;
 
-	let params = pa::StreamParameters::new(device, CHANNELS, true, latency);
-    let mut settings = pa::OutputStreamSettings::new(params, SAMPLE_RATE, pa::FRAMES_PER_BUFFER_UNSPECIFIED);
+    let params = pa::StreamParameters::new(device, CHANNELS, true, latency);
+    let mut settings =
+        pa::OutputStreamSettings::new(params, SAMPLE_RATE, pa::FRAMES_PER_BUFFER_UNSPECIFIED);
     settings.flags = pa::stream_flags::CLIP_OFF;
 
     let mut rng = LGC::new(777);
     let mut fade_in_scalar = 0.0;
-	let mut now_m = None;
+    let mut now_m = None;
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
-		// there is a bug in the portaudio alsa api that makes
-		// the `time` argument empty, so we use the system clock
+        // there is a bug in the portaudio alsa api that makes
+        // the `time` argument empty, so we use the system clock
         // https://github.com/PortAudio/portaudio/issues/498
-		let now = now_m.get_or_insert(Instant::now());
-		let elapsed = now.elapsed();
+        let now = now_m.get_or_insert(Instant::now());
+        let elapsed = now.elapsed();
 
         if fade_in_scalar < 1.0 {
-			let delta = elapsed.as_secs_f32();
+            let delta = elapsed.as_secs_f32();
 
             fade_in_scalar = ((delta / FADE_IN_SECONDS) + 1.0).log2().min(1.0);
         }
