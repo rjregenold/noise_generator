@@ -10,6 +10,15 @@ const CHANNELS: i32 = 2;
 const SAMPLE_RATE: f64 = 44_100.0;
 const FADE_IN_SECONDS: f32 = 10.0;
 
+/// The max random value when generating a u16, represented
+/// as a f32. This helps to generate random f32s in a given
+/// range.
+const RAND_MAX: f32 = u16::MAX as f32;
+
+// --
+// A pink noise generator, ported from:
+// https://github.com/PortAudio/portaudio/blob/master/examples/paex_pink.c
+
 const MAX_RANDOM_ROWS: usize = 30;
 const PINK_RANDOM_BITS: usize = 24;
 const PINK_RANDOM_SHIFT: usize = (std::mem::size_of::<i64>() * 8) - PINK_RANDOM_BITS;
@@ -23,7 +32,9 @@ struct PinkNoise {
 }
 
 fn init_pink_noise(num_rows: usize) -> PinkNoise {
+    // the maximum possible signed random value
     let pmax = (num_rows + 1) * (1 << (PINK_RANDOM_BITS - 1));
+
     PinkNoise {
         rows: [0i64; MAX_RANDOM_ROWS],
         running_sum: 0i64,
@@ -49,41 +60,76 @@ fn generate_pink_noise(rng: &fastrand::Rng, pink_noise: &mut PinkNoise) -> f32 {
 
         pink_noise.running_sum -= pink_noise.rows[num_zeroes];
 
-        new_random = next_random(&rng) >> PINK_RANDOM_SHIFT;
+        new_random = rng.i64(..) >> PINK_RANDOM_SHIFT;
         pink_noise.running_sum += new_random;
         pink_noise.rows[num_zeroes] = new_random;
     }
 
-    new_random = next_random(&rng) >> PINK_RANDOM_SHIFT;
+    new_random = rng.i64(..) >> PINK_RANDOM_SHIFT;
     let sum = pink_noise.running_sum + new_random;
     let output = sum as f32 * pink_noise.scalar;
 
-    output
+    // attempt to increase amplitude
+    f32::min(1f32, output * 2f32)
 }
 
+// --
+
+struct BrownNoise {
+    running_sum: f32,
+}
+
+fn init_brown_noise(rng: &fastrand::Rng) -> BrownNoise {
+    BrownNoise {
+        running_sum: randf(rng, -1f32, 1f32),
+    }
+}
+
+fn generate_brown_noise(rng: &fastrand::Rng, brown_noise: &mut BrownNoise) -> f32 {
+    let (a, b) = match brown_noise.running_sum {
+        sum if sum < -0.95 => (0.1, 0.2),
+        sum if sum > 0.95 => (-0.2, -0.1),
+        _ => (-0.1, 0.1),
+    };
+
+    let offset = randf(rng, a, b);
+
+    brown_noise.running_sum += offset;
+
+    f32::max(f32::min(1f32, brown_noise.running_sum), -1f32)
+}
+
+/// Represents the type of noise to generate.
 #[derive(Debug)]
 enum NoiseType {
     White,
     Pink,
+    Brown,
 }
 
+/// The app config.
 struct Config {
     noise_type: NoiseType,
 }
 
 impl Config {
+    /// Generates a Config from command line arguments.
     fn new(mut args: env::Args) -> Config {
         args.next();
 
         let noise_type = match args.next().as_ref().map(String::as_str) {
             Some("pink") => NoiseType::Pink,
+            Some("brown") => NoiseType::Brown,
             _ => NoiseType::White,
         };
 
-        Config {
-            noise_type: noise_type,
-        }
+        Config { noise_type }
     }
+}
+
+/// Generates a random f32 between low and high.
+fn randf(rng: &fastrand::Rng, low: f32, high: f32) -> f32 {
+    (rng.u16(..) as f32 / RAND_MAX) * f32::abs(low - high) + low
 }
 
 fn main() {
@@ -95,18 +141,6 @@ fn main() {
             eprintln!("Failed to run: {:?}", e);
         }
     }
-}
-
-fn randf(rng: &fastrand::Rng, low: f32, high: f32) -> f32 {
-    (rng.u16(..) as f32 / u16::MAX as f32) * f32::abs(low - high) + low
-}
-
-fn next_random(rng: &fastrand::Rng) -> i64 {
-    rng.i64(..)
-}
-
-fn next_sample(rng: &fastrand::Rng) -> f32 {
-    randf(rng, -1f32, 1f32)
 }
 
 fn run(config: Config) -> Result<(), pa::Error> {
@@ -132,23 +166,23 @@ fn run(config: Config) -> Result<(), pa::Error> {
     let mut fade_in_scalar = 0.0;
     let mut now_m = None;
 
-    // let mut left_pink = init_pink_noise(12);
-    // let mut right_pink = init_pink_noise(16);
+    let mut left_pink = init_pink_noise(12);
+    let mut right_pink = init_pink_noise(16);
 
-    println!("config: {:?}", config.noise_type);
+    let mut left_brown = init_brown_noise(&rng);
+    let mut right_brown = init_brown_noise(&rng);
 
     let msg = format!(
         "playing {} noise. press <enter> to stop.",
         match config.noise_type {
             NoiseType::White => "white",
             NoiseType::Pink => "pink",
+            NoiseType::Brown => "brown",
         }
     )
     .to_string();
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
-        println!("frames: {}", frames);
-
         // there is a bug in the portaudio alsa api that makes
         // the `time` argument empty, so we use the system clock
         // https://github.com/PortAudio/portaudio/issues/498
@@ -164,10 +198,8 @@ fn run(config: Config) -> Result<(), pa::Error> {
         match config.noise_type {
             NoiseType::White => {
                 let num_samples = frames * 2;
-                println!("num_samples: {}", num_samples);
                 for i in 0..num_samples {
-                    buffer[i] = next_sample(&rng) * fade_in_scalar;
-                    println!("buffer[i]: {}", buffer[i]);
+                    buffer[i] = randf(&rng, -1f32, 1f32) * fade_in_scalar;
                 }
             }
 
@@ -176,6 +208,15 @@ fn run(config: Config) -> Result<(), pa::Error> {
                 for _ in 0..frames {
                     buffer[i] = generate_pink_noise(&rng, &mut left_pink) * fade_in_scalar;
                     buffer[i + 1] = generate_pink_noise(&rng, &mut right_pink) * fade_in_scalar;
+                    i += 2
+                }
+            }
+
+            NoiseType::Brown => {
+                let mut i = 0;
+                for _ in 0..frames {
+                    buffer[i] = generate_brown_noise(&rng, &mut left_brown) * fade_in_scalar;
+                    buffer[i + 1] = generate_brown_noise(&rng, &mut right_brown) * fade_in_scalar;
                     i += 2
                 }
             }
