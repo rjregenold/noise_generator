@@ -4,10 +4,11 @@ use fastrand;
 use portaudio as pa;
 use std::env;
 use std::io;
-use std::time::Instant;
+use std::thread;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const CHANNELS: i32 = 2;
-const SAMPLE_RATE: f64 = 44_100.0;
 const FADE_IN_SECONDS: f32 = 10.0;
 
 /// The max random value when generating a u16, represented
@@ -100,7 +101,7 @@ fn generate_brown_noise(rng: &fastrand::Rng, brown_noise: &mut BrownNoise) -> f3
 }
 
 /// Represents the type of noise to generate.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 enum NoiseType {
     White,
     Pink,
@@ -108,6 +109,7 @@ enum NoiseType {
 }
 
 /// The app config.
+#[derive(Copy, Clone, Debug)]
 struct Config {
     noise_type: NoiseType,
 }
@@ -130,6 +132,43 @@ impl Config {
 /// Generates a random f32 between low and high.
 fn randf(rng: &fastrand::Rng, low: f32, high: f32) -> f32 {
     (rng.u16(..) as f32 / RAND_MAX) * f32::abs(low - high) + low
+}
+
+enum VolumeLevel {
+    Mute,
+    _1,
+    _2,
+    _3,
+    _4,
+    _5,
+    _6,
+    _7,
+    _8,
+    _9,
+    Max,
+}
+
+enum Message {
+    SetNoiseType(NoiseType),
+    SetVolume(VolumeLevel),
+    DecVolume,
+    IncVolume,
+}
+
+fn volume_level_to_amp_scalar(vol: VolumeLevel) -> f32 {
+    match vol {
+        VolumeLevel::Mute => 0f32,
+        VolumeLevel::_1 => 0.1,
+        VolumeLevel::_2 => 0.2,
+        VolumeLevel::_3 => 0.3,
+        VolumeLevel::_4 => 0.4,
+        VolumeLevel::_5 => 0.5,
+        VolumeLevel::_6 => 0.6,
+        VolumeLevel::_7 => 0.7,
+        VolumeLevel::_8 => 0.8,
+        VolumeLevel::_9 => 0.9,
+        VolumeLevel::Max => 1f32,
+    }
 }
 
 fn main() {
@@ -159,7 +198,7 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     let params = pa::StreamParameters::new(device, CHANNELS, true, latency);
     let mut settings =
-        pa::OutputStreamSettings::new(params, SAMPLE_RATE, pa::FRAMES_PER_BUFFER_UNSPECIFIED);
+        pa::OutputStreamSettings::new(params, output_info.default_sample_rate, pa::FRAMES_PER_BUFFER_UNSPECIFIED);
     settings.flags = pa::stream_flags::CLIP_OFF;
 
     let rng = fastrand::Rng::with_seed(777);
@@ -182,6 +221,11 @@ fn run(config: Config) -> Result<(), pa::Error> {
     )
     .to_string();
 
+    let (tx, rx) = mpsc::channel();
+
+    let mut noise_type: NoiseType = config.noise_type;
+    let mut amp_scalar: f32 = 1f32;
+
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
         // there is a bug in the portaudio alsa api that makes
         // the `time` argument empty, so we use the system clock
@@ -195,19 +239,30 @@ fn run(config: Config) -> Result<(), pa::Error> {
             fade_in_scalar = ((delta / FADE_IN_SECONDS) + 1.0).log2().min(1.0);
         }
 
-        match config.noise_type {
+        for m in rx.try_iter() {
+            match m {
+                Message::SetNoiseType(nt) => noise_type = nt,
+                Message::SetVolume(v) => amp_scalar = volume_level_to_amp_scalar(v),
+                Message::IncVolume => amp_scalar = f32::max(1f32, amp_scalar + 0.1),
+                Message::DecVolume => amp_scalar = f32::min(0f32, amp_scalar - 0.1),
+            }
+        }
+
+        let final_scalar = fade_in_scalar * amp_scalar;
+
+        match noise_type {
             NoiseType::White => {
                 let num_samples = frames * 2;
                 for i in 0..num_samples {
-                    buffer[i] = randf(&rng, -1f32, 1f32) * fade_in_scalar;
+                    buffer[i] = randf(&rng, -1f32, 1f32) * final_scalar;
                 }
             }
 
             NoiseType::Pink => {
                 let mut i = 0;
                 for _ in 0..frames {
-                    buffer[i] = generate_pink_noise(&rng, &mut left_pink) * fade_in_scalar;
-                    buffer[i + 1] = generate_pink_noise(&rng, &mut right_pink) * fade_in_scalar;
+                    buffer[i] = generate_pink_noise(&rng, &mut left_pink) * final_scalar;
+                    buffer[i + 1] = generate_pink_noise(&rng, &mut right_pink) * final_scalar;
                     i += 2
                 }
             }
@@ -215,8 +270,8 @@ fn run(config: Config) -> Result<(), pa::Error> {
             NoiseType::Brown => {
                 let mut i = 0;
                 for _ in 0..frames {
-                    buffer[i] = generate_brown_noise(&rng, &mut left_brown) * fade_in_scalar;
-                    buffer[i + 1] = generate_brown_noise(&rng, &mut right_brown) * fade_in_scalar;
+                    buffer[i] = generate_brown_noise(&rng, &mut left_brown) * final_scalar;
+                    buffer[i + 1] = generate_brown_noise(&rng, &mut right_brown) * final_scalar;
                     i += 2
                 }
             }
@@ -231,8 +286,23 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     println!("{}", msg);
 
-    let mut _input = String::new();
-    let _ = io::stdin().read_line(&mut _input);
+    let mut input = String::new();
+    loop {
+        let _ = io::stdin().read_line(&mut input);
+        match input.trim() {
+            "up" => tx.send(Message::IncVolume).unwrap(),
+            "down" => tx.send(Message::DecVolume).unwrap(),
+            "vmax" => tx.send(Message::SetVolume(VolumeLevel::Max)).unwrap(),
+            "vmin" => tx.send(Message::SetVolume(VolumeLevel::Mute)).unwrap(),
+            "white" => tx.send(Message::SetNoiseType(NoiseType::White)).unwrap(),
+            "pink" => tx.send(Message::SetNoiseType(NoiseType::Pink)).unwrap(),
+            "brown" => tx.send(Message::SetNoiseType(NoiseType::Brown)).unwrap(),
+            "exit" | "quit" => break,
+            inp => println!("invalid input: {}", inp),
+        };
+
+        input = String::new();
+    }
 
     stream.stop()?;
     stream.close()?;
