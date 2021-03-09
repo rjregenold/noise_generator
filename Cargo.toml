@@ -12,3 +12,4 @@ portaudio = { path = "./lib/rust-portaudio" }
 [dependencies]
 portaudio = "0.7.1"
 fastrand = "1.4.0"
+either = "1.6.1"

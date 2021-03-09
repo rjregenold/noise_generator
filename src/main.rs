@@ -1,12 +1,12 @@
 extern crate portaudio;
 
+use either::*;
 use fastrand;
 use portaudio as pa;
 use std::env;
 use std::io;
-use std::thread;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const CHANNELS: i32 = 2;
 const FADE_IN_SECONDS: f32 = 10.0;
@@ -247,29 +247,18 @@ fn run(config: Config) -> Result<(), pa::Error> {
     let mut left_brown = init_brown_noise(&rng);
     let mut right_brown = init_brown_noise(&rng);
 
-    let msg = format!(
-        "playing {} noise. press <enter> to stop.",
-        match config.noise_type {
-            NoiseType::White => "white",
-            NoiseType::Pink => "pink",
-            NoiseType::Brown => "brown",
-        }
-    )
-    .to_string();
-
     let (tx, rx) = mpsc::channel();
 
     let mut noise_type: NoiseType = config.noise_type;
     let mut volume_level: VolumeLevel = VolumeLevel::Max;
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
-        // there is a bug in the portaudio alsa api that makes
-        // the `time` argument empty, so we use the system clock
-        // https://github.com/PortAudio/portaudio/issues/498
-        let now = now_m.get_or_insert(Instant::now());
-        let elapsed = now.elapsed();
-
         if fade_in_scalar < 1.0 {
+            // there is a bug in the portaudio alsa api that makes
+            // the `time` argument empty, so we use the system clock
+            // https://github.com/PortAudio/portaudio/issues/498
+            let now = now_m.get_or_insert(Instant::now());
+            let elapsed = now.elapsed();
             let delta = elapsed.as_secs_f32();
 
             fade_in_scalar = ((delta / FADE_IN_SECONDS) + 1.0).log2().min(1.0);
@@ -320,24 +309,30 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     stream.start()?;
 
-    println!("{}", msg);
+    println!("generating noise. enter commands or type 'quit' to quit.");
 
-    let mut input = String::new();
     loop {
-        let _ = io::stdin().read_line(&mut input);
-        match input.trim() {
-            "up" => tx.send(Message::IncVolume).unwrap(),
-            "down" => tx.send(Message::DecVolume).unwrap(),
-            "vmax" => tx.send(Message::SetVolume(VolumeLevel::Max)).unwrap(),
-            "vmin" => tx.send(Message::SetVolume(VolumeLevel::Mute)).unwrap(),
-            "white" => tx.send(Message::SetNoiseType(NoiseType::White)).unwrap(),
-            "pink" => tx.send(Message::SetNoiseType(NoiseType::Pink)).unwrap(),
-            "brown" => tx.send(Message::SetNoiseType(NoiseType::Brown)).unwrap(),
-            "exit" | "quit" => break,
-            inp => println!("invalid input: {}", inp),
+        let mut input = String::new();
+
+        io::stdin().read_line(&mut input).unwrap();
+
+        let msg = match input.trim() {
+            "up" => Right(Message::IncVolume),
+            "down" => Right(Message::DecVolume),
+            "vmax" => Right(Message::SetVolume(VolumeLevel::Max)),
+            "vmin" => Right(Message::SetVolume(VolumeLevel::Mute)),
+            "white" => Right(Message::SetNoiseType(NoiseType::White)),
+            "pink" => Right(Message::SetNoiseType(NoiseType::Pink)),
+            "brown" => Right(Message::SetNoiseType(NoiseType::Brown)),
+            "" | "exit" | "quit" => Left(None),
+            inp => Left(Some(inp)),
         };
 
-        input = String::new();
+        match msg {
+            Right(cmd) => tx.send(cmd).unwrap(),
+            Left(Some(inp)) => println!("invalid input: {}", inp),
+            Left(None) => break,
+        };
     }
 
     stream.stop()?;
