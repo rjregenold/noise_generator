@@ -134,6 +134,7 @@ fn randf(rng: &fastrand::Rng, low: f32, high: f32) -> f32 {
     (rng.u16(..) as f32 / RAND_MAX) * f32::abs(low - high) + low
 }
 
+#[derive(Clone, Copy, Debug)]
 enum VolumeLevel {
     Mute,
     _1,
@@ -148,27 +149,62 @@ enum VolumeLevel {
     Max,
 }
 
+impl VolumeLevel {
+    pub fn pred(vol: VolumeLevel) -> VolumeLevel {
+        match vol {
+            VolumeLevel::Mute => VolumeLevel::Mute,
+            VolumeLevel::_1 => VolumeLevel::Mute,
+            VolumeLevel::_2 => VolumeLevel::_1,
+            VolumeLevel::_3 => VolumeLevel::_2,
+            VolumeLevel::_4 => VolumeLevel::_3,
+            VolumeLevel::_5 => VolumeLevel::_4,
+            VolumeLevel::_6 => VolumeLevel::_5,
+            VolumeLevel::_7 => VolumeLevel::_6,
+            VolumeLevel::_8 => VolumeLevel::_7,
+            VolumeLevel::_9 => VolumeLevel::_8,
+            VolumeLevel::Max => VolumeLevel::_9,
+        }
+    }
+
+    pub fn succ(vol: VolumeLevel) -> VolumeLevel {
+        match vol {
+            VolumeLevel::Mute => VolumeLevel::_1,
+            VolumeLevel::_1 => VolumeLevel::_2,
+            VolumeLevel::_2 => VolumeLevel::_3,
+            VolumeLevel::_3 => VolumeLevel::_4,
+            VolumeLevel::_4 => VolumeLevel::_5,
+            VolumeLevel::_5 => VolumeLevel::_6,
+            VolumeLevel::_6 => VolumeLevel::_7,
+            VolumeLevel::_7 => VolumeLevel::_8,
+            VolumeLevel::_8 => VolumeLevel::_9,
+            VolumeLevel::_9 => VolumeLevel::Max,
+            VolumeLevel::Max => VolumeLevel::Max,
+        }
+    }
+
+    pub fn to_amp_scalar(vol: VolumeLevel) -> f32 {
+        match vol {
+            VolumeLevel::Mute => 0f32,
+            VolumeLevel::_1 => 0.1,
+            VolumeLevel::_2 => 0.2,
+            VolumeLevel::_3 => 0.3,
+            VolumeLevel::_4 => 0.4,
+            VolumeLevel::_5 => 0.5,
+            VolumeLevel::_6 => 0.6,
+            VolumeLevel::_7 => 0.7,
+            VolumeLevel::_8 => 0.8,
+            VolumeLevel::_9 => 0.9,
+            VolumeLevel::Max => 1f32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum Message {
     SetNoiseType(NoiseType),
     SetVolume(VolumeLevel),
     DecVolume,
     IncVolume,
-}
-
-fn volume_level_to_amp_scalar(vol: VolumeLevel) -> f32 {
-    match vol {
-        VolumeLevel::Mute => 0f32,
-        VolumeLevel::_1 => 0.1,
-        VolumeLevel::_2 => 0.2,
-        VolumeLevel::_3 => 0.3,
-        VolumeLevel::_4 => 0.4,
-        VolumeLevel::_5 => 0.5,
-        VolumeLevel::_6 => 0.6,
-        VolumeLevel::_7 => 0.7,
-        VolumeLevel::_8 => 0.8,
-        VolumeLevel::_9 => 0.9,
-        VolumeLevel::Max => 1f32,
-    }
 }
 
 fn main() {
@@ -224,7 +260,7 @@ fn run(config: Config) -> Result<(), pa::Error> {
     let (tx, rx) = mpsc::channel();
 
     let mut noise_type: NoiseType = config.noise_type;
-    let mut amp_scalar: f32 = 1f32;
+    let mut volume_level: VolumeLevel = VolumeLevel::Max;
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
         // there is a bug in the portaudio alsa api that makes
@@ -242,13 +278,13 @@ fn run(config: Config) -> Result<(), pa::Error> {
         for m in rx.try_iter() {
             match m {
                 Message::SetNoiseType(nt) => noise_type = nt,
-                Message::SetVolume(v) => amp_scalar = volume_level_to_amp_scalar(v),
-                Message::IncVolume => amp_scalar = f32::max(1f32, amp_scalar + 0.1),
-                Message::DecVolume => amp_scalar = f32::min(0f32, amp_scalar - 0.1),
+                Message::SetVolume(v) => volume_level = v,
+                Message::IncVolume => volume_level = VolumeLevel::succ(volume_level),
+                Message::DecVolume => volume_level = VolumeLevel::pred(volume_level),
             }
         }
 
-        let final_scalar = fade_in_scalar * amp_scalar;
+        let final_scalar = fade_in_scalar * VolumeLevel::to_amp_scalar(volume_level);
 
         match noise_type {
             NoiseType::White => {
