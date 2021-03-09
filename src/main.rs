@@ -3,6 +3,7 @@ extern crate portaudio;
 use either::*;
 use fastrand;
 use portaudio as pa;
+use rppal::gpio::{Gpio, Trigger};
 use std::env;
 use std::io;
 use std::sync::mpsc;
@@ -108,6 +109,16 @@ enum NoiseType {
     Brown,
 }
 
+impl NoiseType {
+    fn succ(noise_type: NoiseType) -> NoiseType {
+        match noise_type {
+            NoiseType::White => NoiseType::Pink,
+            NoiseType::Pink => NoiseType::Brown,
+            NoiseType::Brown => NoiseType::White,
+        }
+    }
+}
+
 /// The app config.
 #[derive(Copy, Clone, Debug)]
 struct Config {
@@ -202,6 +213,7 @@ impl VolumeLevel {
 #[derive(Clone, Copy, Debug)]
 enum Message {
     SetNoiseType(NoiseType),
+    NextNoiseType,
     SetVolume(VolumeLevel),
     DecVolume,
     IncVolume,
@@ -267,6 +279,7 @@ fn run(config: Config) -> Result<(), pa::Error> {
         for m in rx.try_iter() {
             match m {
                 Message::SetNoiseType(nt) => noise_type = nt,
+                Message::NextNoiseType => noise_type = NoiseType::succ(noise_type),
                 Message::SetVolume(v) => volume_level = v,
                 Message::IncVolume => volume_level = VolumeLevel::succ(volume_level),
                 Message::DecVolume => volume_level = VolumeLevel::pred(volume_level),
@@ -309,6 +322,29 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     stream.start()?;
 
+    let gpio = Gpio::new().unwrap();
+
+    // pin 22 is the noise type button
+    let mut noise_type_pin = gpio.get(22).unwrap().into_input_pullup();
+    let noise_type_tx = tx.clone();
+    noise_type_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
+        noise_type_tx.send(Message::NextNoiseType).unwrap();
+    }).unwrap();
+
+    // pin 23 is the volume up button
+    let mut volume_up_pin = gpio.get(23).unwrap().into_input_pullup();
+    let volume_up_tx = tx.clone();
+    volume_up_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
+        volume_up_tx.send(Message::IncVolume).unwrap();
+    }).unwrap();
+
+    // pin 24 is the volume down button
+    let mut volume_down_pin = gpio.get(24).unwrap().into_input_pullup();
+    let volume_down_tx = tx.clone();
+    volume_down_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
+        volume_down_tx.send(Message::DecVolume).unwrap();
+    }).unwrap();
+
     println!("generating noise. enter commands or type 'quit' to quit.");
 
     loop {
@@ -317,13 +353,14 @@ fn run(config: Config) -> Result<(), pa::Error> {
         io::stdin().read_line(&mut input).unwrap();
 
         let msg = match input.trim() {
+            "white" => Right(Message::SetNoiseType(NoiseType::White)),
+            "pink" => Right(Message::SetNoiseType(NoiseType::Pink)),
+            "brown" => Right(Message::SetNoiseType(NoiseType::Brown)),
+            "next" => Right(Message::NextNoiseType),
             "up" => Right(Message::IncVolume),
             "down" => Right(Message::DecVolume),
             "vmax" => Right(Message::SetVolume(VolumeLevel::Max)),
             "vmin" => Right(Message::SetVolume(VolumeLevel::Mute)),
-            "white" => Right(Message::SetNoiseType(NoiseType::White)),
-            "pink" => Right(Message::SetNoiseType(NoiseType::Pink)),
-            "brown" => Right(Message::SetNoiseType(NoiseType::Brown)),
             "" | "exit" | "quit" => Left(None),
             inp => Left(Some(inp)),
         };
