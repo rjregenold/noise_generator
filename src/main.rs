@@ -1,10 +1,11 @@
 extern crate portaudio;
+extern crate clap;
 
+use clap::{Arg, App};
 use either::*;
 use fastrand;
 use portaudio as pa;
-use rppal::gpio::{Gpio, Trigger};
-use std::env;
+use rppal::gpio::{Gpio, InputPin, Trigger};
 use std::io;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -120,23 +121,33 @@ impl NoiseType {
 }
 
 /// The app config.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Config {
-    noise_type: NoiseType,
+    enable_gpio: bool,
+    settings_path: Option<String>,
 }
 
 impl Config {
-    /// Generates a Config from command line arguments.
-    fn new(mut args: env::Args) -> Config {
-        args.next();
+    fn new() -> Config {
+        let matches = App::new("Noise Generator")
+                        .version("1.0")
+                        .author("RJ Regenold")
+                        .about("Generates different types of noise")
+                        .arg(Arg::with_name("enable-gpio")
+                            .short("g")
+                            .long("enable-gpio")
+                            .help("Enables GPIO pins"))
+                        .arg(Arg::with_name("settings")
+                            .short("s")
+                            .long("settings")
+                            .help("Path to file where app settings can be stored")
+                            .takes_value(true))
+                        .get_matches();
 
-        let noise_type = match args.next().as_ref().map(String::as_str) {
-            Some("pink") => NoiseType::Pink,
-            Some("brown") => NoiseType::Brown,
-            _ => NoiseType::White,
-        };
+        let enable_gpio = matches.is_present("enable-gpio");
+        let settings_path = matches.value_of("settings");
 
-        Config { noise_type }
+        Config { enable_gpio, settings_path: settings_path.map(String::from) }
     }
 }
 
@@ -220,14 +231,59 @@ enum Message {
 }
 
 fn main() {
-    let config = Config::new(env::args());
-
-    match run(config) {
+    match run(Config::new()) {
         Ok(_) => {}
         e => {
             eprintln!("Failed to run: {:?}", e);
         }
     }
+}
+
+struct AppPins {
+    noise_type_pin: InputPin,
+    volume_up_pin: InputPin,
+    volume_down_pin: InputPin,
+}
+
+fn debounce<F, T>(duration: std::time::Duration, mut f: F) -> impl FnMut(T)
+    where F: FnMut(T) {
+    let mut last_run_at: Option<Instant> = None;
+    move |a| {
+        if last_run_at.map_or(true, |x| x.elapsed() > duration) {
+            f(a);
+            last_run_at = Some(Instant::now());
+        }
+    }
+}
+
+fn setup_gpio(tx: &mpsc::Sender<Message>) -> AppPins {
+    println!("setting up gpio");
+
+    let gpio = Gpio::new().unwrap();
+    let debounce_time = std::time::Duration::from_millis(150);
+
+    let configure_pin = |pin: u8, msg: Message| {
+        let mut input_pin = gpio.get(pin).unwrap().into_input_pullup();
+        let pin_tx = tx.clone();
+        let mut trigger_count = 0;
+        input_pin.set_async_interrupt(Trigger::FallingEdge, debounce(debounce_time, move |_| {
+            trigger_count = trigger_count + 1;
+            println!("input pin {} triggered: {}", pin, trigger_count);
+            pin_tx.send(msg).unwrap();
+        })).unwrap();
+        input_pin
+    };
+
+    // pin 22 is the noise type button
+    let noise_type_pin = configure_pin(22, Message::NextNoiseType);
+
+    // pin 23 is the volume up button
+    let volume_up_pin = configure_pin(23, Message::IncVolume);
+
+    // pin 24 is the volume down button
+    let volume_down_pin = configure_pin(24, Message::DecVolume);
+
+    AppPins { noise_type_pin, volume_up_pin, volume_down_pin }
 }
 
 fn run(config: Config) -> Result<(), pa::Error> {
@@ -261,7 +317,8 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     let (tx, rx) = mpsc::channel();
 
-    let mut noise_type: NoiseType = config.noise_type;
+    // TODO: get these from settings file.
+    let mut noise_type: NoiseType = NoiseType::White;
     let mut volume_level: VolumeLevel = VolumeLevel::Max;
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
@@ -322,28 +379,10 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     stream.start()?;
 
-    let gpio = Gpio::new().unwrap();
-
-    // pin 22 is the noise type button
-    let mut noise_type_pin = gpio.get(22).unwrap().into_input_pullup();
-    let noise_type_tx = tx.clone();
-    noise_type_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
-        noise_type_tx.send(Message::NextNoiseType).unwrap();
-    }).unwrap();
-
-    // pin 23 is the volume up button
-    let mut volume_up_pin = gpio.get(23).unwrap().into_input_pullup();
-    let volume_up_tx = tx.clone();
-    volume_up_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
-        volume_up_tx.send(Message::IncVolume).unwrap();
-    }).unwrap();
-
-    // pin 24 is the volume down button
-    let mut volume_down_pin = gpio.get(24).unwrap().into_input_pullup();
-    let volume_down_tx = tx.clone();
-    volume_down_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
-        volume_down_tx.send(Message::DecVolume).unwrap();
-    }).unwrap();
+    let mut app_pins: Option<AppPins> = None;
+    if config.enable_gpio {
+        app_pins = Some(setup_gpio(&tx));
+    }
 
     println!("generating noise. enter commands or type 'quit' to quit.");
 
@@ -374,6 +413,13 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     stream.stop()?;
     stream.close()?;
+
+    if app_pins.is_some() {
+        let mut pins = app_pins.unwrap();
+        pins.noise_type_pin.clear_async_interrupt().unwrap();
+        pins.volume_up_pin.clear_async_interrupt().unwrap();
+        pins.volume_down_pin.clear_async_interrupt().unwrap();
+    }
 
     Ok(())
 }
