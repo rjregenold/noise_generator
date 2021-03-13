@@ -1,6 +1,6 @@
-# White Noise Generator for Raspberry Pi Zero
+# Noise Generator for Raspberry Pi Zero
 
-This repository contains the code to create a white noise generator using a Raspberry Pi Zero.
+This repository contains the code to create a noise generator using a Raspberry Pi Zero.
 
 ## Building
 
