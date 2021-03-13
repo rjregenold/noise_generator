@@ -1,11 +1,12 @@
 extern crate portaudio;
 extern crate clap;
 
+mod gpio;
+
 use clap::{Arg, App};
 use either::*;
 use fastrand;
 use portaudio as pa;
-use rppal::gpio::{Gpio, InputPin, Trigger};
 use std::io;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -239,51 +240,43 @@ fn main() {
     }
 }
 
-struct AppPins {
-    noise_type_pin: InputPin,
-    volume_up_pin: InputPin,
-    volume_down_pin: InputPin,
-}
+const PIN_NOISE_TYPE: u8 = 22;
+const PIN_INC_VOLUME: u8 = 23;
+const PIN_DEC_VOLUME: u8 = 24;
 
-fn debounce<F, T>(duration: std::time::Duration, mut f: F) -> impl FnMut(T)
-    where F: FnMut(T) {
-    let mut last_run_at: Option<Instant> = None;
-    move |a| {
-        if last_run_at.map_or(true, |x| x.elapsed() > duration) {
-            f(a);
-            last_run_at = Some(Instant::now());
-        }
-    }
-}
+fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
+    let (rx, clear_push_buttons) = gpio::setup_push_buttons(vec![
+        PIN_NOISE_TYPE,
+        PIN_INC_VOLUME,
+        PIN_DEC_VOLUME,
+    ]);
 
-fn setup_gpio(tx: &mpsc::Sender<Message>) -> AppPins {
-    println!("setting up gpio");
-
-    let gpio = Gpio::new().unwrap();
-    let debounce_time = std::time::Duration::from_millis(150);
-
-    let configure_pin = |pin: u8, msg: Message| {
-        let mut input_pin = gpio.get(pin).unwrap().into_input_pullup();
-        let pin_tx = tx.clone();
-        let mut trigger_count = 0;
-        input_pin.set_async_interrupt(Trigger::FallingEdge, debounce(debounce_time, move |_| {
-            trigger_count = trigger_count + 1;
-            println!("input pin {} triggered: {}", pin, trigger_count);
-            pin_tx.send(msg).unwrap();
-        })).unwrap();
-        input_pin
+    let cleanup = move || {
+        clear_push_buttons();
     };
 
-    // pin 22 is the noise type button
-    let noise_type_pin = configure_pin(22, Message::NextNoiseType);
+    std::thread::spawn(move || {
+        loop {
+            for msg in &rx {
 
-    // pin 23 is the volume up button
-    let volume_up_pin = configure_pin(23, Message::IncVolume);
+                match msg {
+                    gpio::Message::ButtonPressed(pin) => {
+                        println!("button pressed: {}", pin);
+                        match pin {
+                            PIN_NOISE_TYPE => tx.send(Message::NextNoiseType).unwrap(),
+                            PIN_INC_VOLUME => tx.send(Message::IncVolume).unwrap(),
+                            PIN_DEC_VOLUME => tx.send(Message::DecVolume).unwrap(),
+                            _ => (),
+                        };
+                    },
+                    gpio::Message::Terminate => break,
+                    _ => {},
+                };
+            }
+        }
+    });
 
-    // pin 24 is the volume down button
-    let volume_down_pin = configure_pin(24, Message::DecVolume);
-
-    AppPins { noise_type_pin, volume_up_pin, volume_down_pin }
+    cleanup
 }
 
 fn run(config: Config) -> Result<(), pa::Error> {
@@ -379,10 +372,12 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     stream.start()?;
 
-    let mut app_pins: Option<AppPins> = None;
-    if config.enable_gpio {
-        app_pins = Some(setup_gpio(&tx));
-    }
+    let mut cleanup_gpio = None;
+
+    match config.enable_gpio {
+        true => cleanup_gpio = Some(setup_gpio(tx.clone())),
+        false => (),
+    };
 
     println!("generating noise. enter commands or type 'quit' to quit.");
 
@@ -414,12 +409,7 @@ fn run(config: Config) -> Result<(), pa::Error> {
     stream.stop()?;
     stream.close()?;
 
-    if app_pins.is_some() {
-        let mut pins = app_pins.unwrap();
-        pins.noise_type_pin.clear_async_interrupt().unwrap();
-        pins.volume_up_pin.clear_async_interrupt().unwrap();
-        pins.volume_down_pin.clear_async_interrupt().unwrap();
-    }
+    cleanup_gpio.map(|x| x());
 
     Ok(())
 }
