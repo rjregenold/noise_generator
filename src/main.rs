@@ -1,13 +1,17 @@
 extern crate portaudio;
+extern crate clap;
 
+mod gpio;
+
+use clap::{Arg, App};
+use either::*;
 use fastrand;
 use portaudio as pa;
-use std::env;
 use std::io;
+use std::sync::mpsc;
 use std::time::Instant;
 
 const CHANNELS: i32 = 2;
-const SAMPLE_RATE: f64 = 44_100.0;
 const FADE_IN_SECONDS: f32 = 10.0;
 
 /// The max random value when generating a u16, represented
@@ -100,30 +104,51 @@ fn generate_brown_noise(rng: &fastrand::Rng, brown_noise: &mut BrownNoise) -> f3
 }
 
 /// Represents the type of noise to generate.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 enum NoiseType {
     White,
     Pink,
     Brown,
 }
 
+impl NoiseType {
+    fn succ(noise_type: NoiseType) -> NoiseType {
+        match noise_type {
+            NoiseType::White => NoiseType::Pink,
+            NoiseType::Pink => NoiseType::Brown,
+            NoiseType::Brown => NoiseType::White,
+        }
+    }
+}
+
 /// The app config.
+#[derive(Clone, Debug)]
 struct Config {
-    noise_type: NoiseType,
+    enable_gpio: bool,
+    settings_path: Option<String>,
 }
 
 impl Config {
-    /// Generates a Config from command line arguments.
-    fn new(mut args: env::Args) -> Config {
-        args.next();
+    fn new() -> Config {
+        let matches = App::new("Noise Generator")
+                        .version("1.0")
+                        .author("RJ Regenold")
+                        .about("Generates different types of noise")
+                        .arg(Arg::with_name("enable-gpio")
+                            .short("g")
+                            .long("enable-gpio")
+                            .help("Enables GPIO pins"))
+                        .arg(Arg::with_name("settings")
+                            .short("s")
+                            .long("settings")
+                            .help("Path to file where app settings can be stored")
+                            .takes_value(true))
+                        .get_matches();
 
-        let noise_type = match args.next().as_ref().map(String::as_str) {
-            Some("pink") => NoiseType::Pink,
-            Some("brown") => NoiseType::Brown,
-            _ => NoiseType::White,
-        };
+        let enable_gpio = matches.is_present("enable-gpio");
+        let settings_path = matches.value_of("settings");
 
-        Config { noise_type }
+        Config { enable_gpio, settings_path: settings_path.map(String::from) }
     }
 }
 
@@ -132,15 +157,126 @@ fn randf(rng: &fastrand::Rng, low: f32, high: f32) -> f32 {
     (rng.u16(..) as f32 / RAND_MAX) * f32::abs(low - high) + low
 }
 
-fn main() {
-    let config = Config::new(env::args());
+#[derive(Clone, Copy, Debug)]
+enum VolumeLevel {
+    Mute,
+    _1,
+    _2,
+    _3,
+    _4,
+    _5,
+    _6,
+    _7,
+    _8,
+    _9,
+    Max,
+}
 
-    match run(config) {
+impl VolumeLevel {
+    pub fn pred(vol: VolumeLevel) -> VolumeLevel {
+        match vol {
+            VolumeLevel::Mute => VolumeLevel::Mute,
+            VolumeLevel::_1 => VolumeLevel::Mute,
+            VolumeLevel::_2 => VolumeLevel::_1,
+            VolumeLevel::_3 => VolumeLevel::_2,
+            VolumeLevel::_4 => VolumeLevel::_3,
+            VolumeLevel::_5 => VolumeLevel::_4,
+            VolumeLevel::_6 => VolumeLevel::_5,
+            VolumeLevel::_7 => VolumeLevel::_6,
+            VolumeLevel::_8 => VolumeLevel::_7,
+            VolumeLevel::_9 => VolumeLevel::_8,
+            VolumeLevel::Max => VolumeLevel::_9,
+        }
+    }
+
+    pub fn succ(vol: VolumeLevel) -> VolumeLevel {
+        match vol {
+            VolumeLevel::Mute => VolumeLevel::_1,
+            VolumeLevel::_1 => VolumeLevel::_2,
+            VolumeLevel::_2 => VolumeLevel::_3,
+            VolumeLevel::_3 => VolumeLevel::_4,
+            VolumeLevel::_4 => VolumeLevel::_5,
+            VolumeLevel::_5 => VolumeLevel::_6,
+            VolumeLevel::_6 => VolumeLevel::_7,
+            VolumeLevel::_7 => VolumeLevel::_8,
+            VolumeLevel::_8 => VolumeLevel::_9,
+            VolumeLevel::_9 => VolumeLevel::Max,
+            VolumeLevel::Max => VolumeLevel::Max,
+        }
+    }
+
+    pub fn to_amp_scalar(vol: VolumeLevel) -> f32 {
+        match vol {
+            VolumeLevel::Mute => 0f32,
+            VolumeLevel::_1 => 0.1,
+            VolumeLevel::_2 => 0.2,
+            VolumeLevel::_3 => 0.3,
+            VolumeLevel::_4 => 0.4,
+            VolumeLevel::_5 => 0.5,
+            VolumeLevel::_6 => 0.6,
+            VolumeLevel::_7 => 0.7,
+            VolumeLevel::_8 => 0.8,
+            VolumeLevel::_9 => 0.9,
+            VolumeLevel::Max => 1f32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Message {
+    SetNoiseType(NoiseType),
+    NextNoiseType,
+    SetVolume(VolumeLevel),
+    DecVolume,
+    IncVolume,
+}
+
+fn main() {
+    match run(Config::new()) {
         Ok(_) => {}
         e => {
             eprintln!("Failed to run: {:?}", e);
         }
     }
+}
+
+const PIN_NOISE_TYPE: u8 = 22;
+const PIN_INC_VOLUME: u8 = 23;
+const PIN_DEC_VOLUME: u8 = 24;
+
+fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
+    let (rx, clear_push_buttons) = gpio::setup_push_buttons(vec![
+        PIN_NOISE_TYPE,
+        PIN_INC_VOLUME,
+        PIN_DEC_VOLUME,
+    ]);
+
+    let cleanup = move || {
+        clear_push_buttons();
+    };
+
+    std::thread::spawn(move || {
+        loop {
+            for msg in &rx {
+
+                match msg {
+                    gpio::Message::ButtonPressed(pin) => {
+                        println!("button pressed: {}", pin);
+                        match pin {
+                            PIN_NOISE_TYPE => tx.send(Message::NextNoiseType).unwrap(),
+                            PIN_INC_VOLUME => tx.send(Message::IncVolume).unwrap(),
+                            PIN_DEC_VOLUME => tx.send(Message::DecVolume).unwrap(),
+                            _ => (),
+                        };
+                    },
+                    gpio::Message::Terminate => break,
+                    _ => {},
+                };
+            }
+        }
+    });
+
+    cleanup
 }
 
 fn run(config: Config) -> Result<(), pa::Error> {
@@ -159,7 +295,7 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     let params = pa::StreamParameters::new(device, CHANNELS, true, latency);
     let mut settings =
-        pa::OutputStreamSettings::new(params, SAMPLE_RATE, pa::FRAMES_PER_BUFFER_UNSPECIFIED);
+        pa::OutputStreamSettings::new(params, output_info.default_sample_rate, pa::FRAMES_PER_BUFFER_UNSPECIFIED);
     settings.flags = pa::stream_flags::CLIP_OFF;
 
     let rng = fastrand::Rng::with_seed(777);
@@ -172,42 +308,49 @@ fn run(config: Config) -> Result<(), pa::Error> {
     let mut left_brown = init_brown_noise(&rng);
     let mut right_brown = init_brown_noise(&rng);
 
-    let msg = format!(
-        "playing {} noise. press <enter> to stop.",
-        match config.noise_type {
-            NoiseType::White => "white",
-            NoiseType::Pink => "pink",
-            NoiseType::Brown => "brown",
-        }
-    )
-    .to_string();
+    let (tx, rx) = mpsc::channel();
+
+    // TODO: get these from settings file.
+    let mut noise_type: NoiseType = NoiseType::White;
+    let mut volume_level: VolumeLevel = VolumeLevel::Max;
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
-        // there is a bug in the portaudio alsa api that makes
-        // the `time` argument empty, so we use the system clock
-        // https://github.com/PortAudio/portaudio/issues/498
-        let now = now_m.get_or_insert(Instant::now());
-        let elapsed = now.elapsed();
-
         if fade_in_scalar < 1.0 {
+            // there is a bug in the portaudio alsa api that makes
+            // the `time` argument empty, so we use the system clock
+            // https://github.com/PortAudio/portaudio/issues/498
+            let now = now_m.get_or_insert(Instant::now());
+            let elapsed = now.elapsed();
             let delta = elapsed.as_secs_f32();
 
             fade_in_scalar = ((delta / FADE_IN_SECONDS) + 1.0).log2().min(1.0);
         }
 
-        match config.noise_type {
+        for m in rx.try_iter() {
+            match m {
+                Message::SetNoiseType(nt) => noise_type = nt,
+                Message::NextNoiseType => noise_type = NoiseType::succ(noise_type),
+                Message::SetVolume(v) => volume_level = v,
+                Message::IncVolume => volume_level = VolumeLevel::succ(volume_level),
+                Message::DecVolume => volume_level = VolumeLevel::pred(volume_level),
+            }
+        }
+
+        let final_scalar = fade_in_scalar * VolumeLevel::to_amp_scalar(volume_level);
+
+        match noise_type {
             NoiseType::White => {
                 let num_samples = frames * 2;
                 for i in 0..num_samples {
-                    buffer[i] = randf(&rng, -1f32, 1f32) * fade_in_scalar;
+                    buffer[i] = randf(&rng, -1f32, 1f32) * final_scalar;
                 }
             }
 
             NoiseType::Pink => {
                 let mut i = 0;
                 for _ in 0..frames {
-                    buffer[i] = generate_pink_noise(&rng, &mut left_pink) * fade_in_scalar;
-                    buffer[i + 1] = generate_pink_noise(&rng, &mut right_pink) * fade_in_scalar;
+                    buffer[i] = generate_pink_noise(&rng, &mut left_pink) * final_scalar;
+                    buffer[i + 1] = generate_pink_noise(&rng, &mut right_pink) * final_scalar;
                     i += 2
                 }
             }
@@ -215,8 +358,8 @@ fn run(config: Config) -> Result<(), pa::Error> {
             NoiseType::Brown => {
                 let mut i = 0;
                 for _ in 0..frames {
-                    buffer[i] = generate_brown_noise(&rng, &mut left_brown) * fade_in_scalar;
-                    buffer[i + 1] = generate_brown_noise(&rng, &mut right_brown) * fade_in_scalar;
+                    buffer[i] = generate_brown_noise(&rng, &mut left_brown) * final_scalar;
+                    buffer[i + 1] = generate_brown_noise(&rng, &mut right_brown) * final_scalar;
                     i += 2
                 }
             }
@@ -229,13 +372,44 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     stream.start()?;
 
-    println!("{}", msg);
+    let mut cleanup_gpio = None;
 
-    let mut _input = String::new();
-    let _ = io::stdin().read_line(&mut _input);
+    match config.enable_gpio {
+        true => cleanup_gpio = Some(setup_gpio(tx.clone())),
+        false => (),
+    };
+
+    println!("generating noise. enter commands or type 'quit' to quit.");
+
+    loop {
+        let mut input = String::new();
+
+        io::stdin().read_line(&mut input).unwrap();
+
+        let msg = match input.trim() {
+            "white" => Right(Message::SetNoiseType(NoiseType::White)),
+            "pink" => Right(Message::SetNoiseType(NoiseType::Pink)),
+            "brown" => Right(Message::SetNoiseType(NoiseType::Brown)),
+            "next" => Right(Message::NextNoiseType),
+            "up" => Right(Message::IncVolume),
+            "down" => Right(Message::DecVolume),
+            "vmax" => Right(Message::SetVolume(VolumeLevel::Max)),
+            "vmin" => Right(Message::SetVolume(VolumeLevel::Mute)),
+            "" | "exit" | "quit" => Left(None),
+            inp => Left(Some(inp)),
+        };
+
+        match msg {
+            Right(cmd) => tx.send(cmd).unwrap(),
+            Left(Some(inp)) => println!("invalid input: {}", inp),
+            Left(None) => break,
+        };
+    }
 
     stream.stop()?;
     stream.close()?;
+
+    cleanup_gpio.map(|x| x());
 
     Ok(())
 }
