@@ -9,7 +9,7 @@ use fastrand;
 use portaudio as pa;
 use std::io;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CHANNELS: i32 = 2;
 const FADE_IN_SECONDS: f32 = 10.0;
@@ -240,15 +240,25 @@ fn main() {
     }
 }
 
+const PIN_POWER: u8 = 5;
 const PIN_NOISE_TYPE: u8 = 22;
 const PIN_INC_VOLUME: u8 = 23;
 const PIN_DEC_VOLUME: u8 = 24;
 
 fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
-    let (rx, clear_push_buttons) = gpio::setup_push_buttons(vec![
+    /*
+    let (rx, clear_push_buttons) = gpio::setup_push_buttons_interrupt(vec![
         PIN_NOISE_TYPE,
         PIN_INC_VOLUME,
         PIN_DEC_VOLUME,
+    ]);
+    */
+
+    let (rx, clear_push_buttons) = gpio::setup_push_buttons_poll(vec![
+        (PIN_POWER, gpio::PushButtonBehavior::PressHold(Duration::from_secs(2), None)),
+        (PIN_NOISE_TYPE, gpio::PushButtonBehavior::Switch),
+        (PIN_INC_VOLUME, gpio::PushButtonBehavior::PressHold(Duration::from_secs(1), Some(Duration::from_millis(250)))),
+        (PIN_DEC_VOLUME, gpio::PushButtonBehavior::PressHold(Duration::from_secs(1), Some(Duration::from_millis(250)))),
     ]);
 
     let cleanup = move || {
@@ -256,21 +266,40 @@ fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
     };
 
     std::thread::spawn(move || {
+        let mut counter = 0;
         loop {
             for msg in &rx {
 
                 match msg {
-                    gpio::Message::ButtonPressed(pin) => {
-                        println!("button pressed: {}", pin);
+                    gpio::Message::ButtonPushed(pin) => {
+                        counter = counter + 1;
+                        println!("button pressed {}: {}", pin, counter);
                         match pin {
+                            PIN_POWER => {
+                                println!("would stop stream");
+                            },
                             PIN_NOISE_TYPE => tx.send(Message::NextNoiseType).unwrap(),
                             PIN_INC_VOLUME => tx.send(Message::IncVolume).unwrap(),
                             PIN_DEC_VOLUME => tx.send(Message::DecVolume).unwrap(),
-                            _ => (),
+                            _ => {},
                         };
                     },
+                    gpio::Message::ButtonHeld(pin) => {
+                        counter = counter + 1;
+                        println!("button held {}: {}", pin, counter);
+                        match pin {
+                            PIN_POWER => {
+                                println!("would shutdown raspberry pi");
+                            },
+                            PIN_INC_VOLUME => tx.send(Message::IncVolume).unwrap(),
+                            PIN_NOISE_TYPE => tx.send(Message::DecVolume).unwrap(),
+                            _ => {},
+                        }
+                    },
+                    gpio::Message::ButtonReleased(pin) => {
+                        println!("button released {}", pin);
+                    }
                     gpio::Message::Terminate => break,
-                    _ => {},
                 };
             }
         }
