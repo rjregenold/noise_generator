@@ -17,7 +17,7 @@ pub enum PushButtonBehavior {
     
     /// sends multiple pressed events when the button
     /// is held down.
-    PressHold(Duration, Option<Duration>),
+    PushHold(Duration, Option<Duration>),
 }
 
 struct PinConfig {
@@ -47,6 +47,7 @@ pub enum Message {
     ButtonPushed(u8),
     ButtonHeld(u8),
     ButtonReleased(u8),
+    ButtonHeldReleased(u8),
     Terminate,
 }
 
@@ -176,7 +177,10 @@ pub fn setup_push_buttons_poll(pins: Vec<(u8, PushButtonBehavior)>) -> (mpsc::Re
                 match no_debounce_switch(&mut x) {
                     true => {
                         let msg = match x.state {
-                            ButtonState::Up => Message::ButtonReleased(x.pin.pin()),
+                            ButtonState::Up => match x.last_message_at {
+                                Some(_) => Message::ButtonHeldReleased(x.pin.pin()),
+                                None => Message::ButtonReleased(x.pin.pin()),
+                            },
                             ButtonState::Down => Message::ButtonPushed(x.pin.pin()),
                         };
 
@@ -185,11 +189,11 @@ pub fn setup_push_buttons_poll(pins: Vec<(u8, PushButtonBehavior)>) -> (mpsc::Re
                         }
 
                         match (x.behavior, x.state) {
-                            (PushButtonBehavior::PressHold(_, _), ButtonState::Down) => {
+                            (PushButtonBehavior::PushHold(_, _), ButtonState::Down) => {
                                 x.pushed_at = Some(Instant::now());
                                 x.last_message_at = None;
                             },
-                            (PushButtonBehavior::PressHold(_, _), ButtonState::Up) => {
+                            (PushButtonBehavior::PushHold(_, _), ButtonState::Up) => {
                                 x.pushed_at = None;
                                 x.last_message_at = None;
                             },
@@ -198,7 +202,7 @@ pub fn setup_push_buttons_poll(pins: Vec<(u8, PushButtonBehavior)>) -> (mpsc::Re
                     },
                     false => {
                         match (x.behavior, x.state) {
-                            (PushButtonBehavior::PressHold(wait, interval), ButtonState::Down) => {
+                            (PushButtonBehavior::PushHold(wait, interval), ButtonState::Down) => {
                                 match (x.pushed_at, x.last_message_at) {
                                     (Some(pushed_at), None) if pushed_at.elapsed() >= wait => {
                                         if let Err(_err) = tx.send(Message::ButtonHeld(x.pin.pin())) {

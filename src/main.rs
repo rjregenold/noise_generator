@@ -8,11 +8,13 @@ use either::*;
 use fastrand;
 use portaudio as pa;
 use std::io;
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const CHANNELS: i32 = 2;
-const FADE_IN_SECONDS: f32 = 10.0;
+const FADE_IN_SECS: f32 = 10f32;
+const FADE_OUT_SECS: f32 = 2f32;
 
 /// The max random value when generating a u16, represented
 /// as a f32. This helps to generate random f32s in a given
@@ -125,6 +127,7 @@ impl NoiseType {
 #[derive(Clone, Debug)]
 struct Config {
     enable_gpio: bool,
+    perform_shutdown: bool,
     settings_path: Option<String>,
 }
 
@@ -138,6 +141,10 @@ impl Config {
                             .short("g")
                             .long("enable-gpio")
                             .help("Enables GPIO pins"))
+                        .arg(Arg::with_name("perform-shutdown")
+                            .short("s")
+                            .long("perform-shutdown")
+                            .help("Executes shutdown command when done"))
                         .arg(Arg::with_name("settings")
                             .short("s")
                             .long("settings")
@@ -146,9 +153,10 @@ impl Config {
                         .get_matches();
 
         let enable_gpio = matches.is_present("enable-gpio");
+        let perform_shutdown = matches.is_present("perform-shutdown");
         let settings_path = matches.value_of("settings");
 
-        Config { enable_gpio, settings_path: settings_path.map(String::from) }
+        Config { enable_gpio, perform_shutdown, settings_path: settings_path.map(String::from) }
     }
 }
 
@@ -159,7 +167,8 @@ fn randf(rng: &fastrand::Rng, low: f32, high: f32) -> f32 {
 
 #[derive(Clone, Copy, Debug)]
 enum VolumeLevel {
-    Mute,
+    // do not allow volume to be muted as the user might
+    // not know if the machine is off or just muted.
     _1,
     _2,
     _3,
@@ -175,8 +184,7 @@ enum VolumeLevel {
 impl VolumeLevel {
     pub fn pred(vol: VolumeLevel) -> VolumeLevel {
         match vol {
-            VolumeLevel::Mute => VolumeLevel::Mute,
-            VolumeLevel::_1 => VolumeLevel::Mute,
+            VolumeLevel::_1 => VolumeLevel::_1,
             VolumeLevel::_2 => VolumeLevel::_1,
             VolumeLevel::_3 => VolumeLevel::_2,
             VolumeLevel::_4 => VolumeLevel::_3,
@@ -191,7 +199,6 @@ impl VolumeLevel {
 
     pub fn succ(vol: VolumeLevel) -> VolumeLevel {
         match vol {
-            VolumeLevel::Mute => VolumeLevel::_1,
             VolumeLevel::_1 => VolumeLevel::_2,
             VolumeLevel::_2 => VolumeLevel::_3,
             VolumeLevel::_3 => VolumeLevel::_4,
@@ -207,7 +214,6 @@ impl VolumeLevel {
 
     pub fn to_amp_scalar(vol: VolumeLevel) -> f32 {
         match vol {
-            VolumeLevel::Mute => 0f32,
             VolumeLevel::_1 => 0.1,
             VolumeLevel::_2 => 0.2,
             VolumeLevel::_3 => 0.3,
@@ -224,11 +230,21 @@ impl VolumeLevel {
 
 #[derive(Clone, Copy, Debug)]
 enum Message {
+    PowerPushed,
+    PowerHeld,
     SetNoiseType(NoiseType),
     NextNoiseType,
     SetVolume(VolumeLevel),
     DecVolume,
     IncVolume,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamMessage {
+    Start(NoiseType, VolumeLevel),
+    Stop,
+    SetNoiseType(NoiseType),
+    SetVolume(VolumeLevel),
 }
 
 fn main() {
@@ -240,25 +256,17 @@ fn main() {
     }
 }
 
-const PIN_POWER: u8 = 5;
+const PIN_POWER: u8 = 3;
 const PIN_NOISE_TYPE: u8 = 22;
 const PIN_INC_VOLUME: u8 = 23;
 const PIN_DEC_VOLUME: u8 = 24;
 
 fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
-    /*
-    let (rx, clear_push_buttons) = gpio::setup_push_buttons_interrupt(vec![
-        PIN_NOISE_TYPE,
-        PIN_INC_VOLUME,
-        PIN_DEC_VOLUME,
-    ]);
-    */
-
     let (rx, clear_push_buttons) = gpio::setup_push_buttons_poll(vec![
-        (PIN_POWER, gpio::PushButtonBehavior::PressHold(Duration::from_secs(2), None)),
+        (PIN_POWER, gpio::PushButtonBehavior::PushHold(Duration::from_secs(2), None)),
         (PIN_NOISE_TYPE, gpio::PushButtonBehavior::Switch),
-        (PIN_INC_VOLUME, gpio::PushButtonBehavior::PressHold(Duration::from_secs(1), Some(Duration::from_millis(250)))),
-        (PIN_DEC_VOLUME, gpio::PushButtonBehavior::PressHold(Duration::from_secs(1), Some(Duration::from_millis(250)))),
+        (PIN_INC_VOLUME, gpio::PushButtonBehavior::PushHold(Duration::from_secs(1), Some(Duration::from_millis(250)))),
+        (PIN_DEC_VOLUME, gpio::PushButtonBehavior::PushHold(Duration::from_secs(1), Some(Duration::from_millis(250)))),
     ]);
 
     let cleanup = move || {
@@ -266,18 +274,11 @@ fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
     };
 
     std::thread::spawn(move || {
-        let mut counter = 0;
         loop {
             for msg in &rx {
-
                 match msg {
                     gpio::Message::ButtonPushed(pin) => {
-                        counter = counter + 1;
-                        println!("button pressed {}: {}", pin, counter);
                         match pin {
-                            PIN_POWER => {
-                                println!("would stop stream");
-                            },
                             PIN_NOISE_TYPE => tx.send(Message::NextNoiseType).unwrap(),
                             PIN_INC_VOLUME => tx.send(Message::IncVolume).unwrap(),
                             PIN_DEC_VOLUME => tx.send(Message::DecVolume).unwrap(),
@@ -285,19 +286,23 @@ fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
                         };
                     },
                     gpio::Message::ButtonHeld(pin) => {
-                        counter = counter + 1;
-                        println!("button held {}: {}", pin, counter);
                         match pin {
-                            PIN_POWER => {
-                                println!("would shutdown raspberry pi");
-                            },
                             PIN_INC_VOLUME => tx.send(Message::IncVolume).unwrap(),
-                            PIN_NOISE_TYPE => tx.send(Message::DecVolume).unwrap(),
+                            PIN_DEC_VOLUME => tx.send(Message::DecVolume).unwrap(),
                             _ => {},
                         }
                     },
                     gpio::Message::ButtonReleased(pin) => {
-                        println!("button released {}", pin);
+                        match pin {
+                            PIN_POWER => tx.send(Message::PowerPushed).unwrap(),
+                            _ => {},
+                        }
+                    },
+                    gpio::Message::ButtonHeldReleased(pin) => {
+                        match pin {
+                            PIN_POWER => tx.send(Message::PowerHeld).unwrap(),
+                            _ => {},
+                        }
                     }
                     gpio::Message::Terminate => break,
                 };
@@ -308,7 +313,15 @@ fn setup_gpio(tx: mpsc::Sender<Message>) -> impl FnOnce() {
     cleanup
 }
 
-fn run(config: Config) -> Result<(), pa::Error> {
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum StreamState {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
+fn setup_stream(rx: mpsc::Receiver<StreamMessage>, init_noise_type: NoiseType, init_volume_level: VolumeLevel) -> Result<pa::Stream<pa::NonBlocking, pa::Output<f32>>, pa::Error> {
     let pa = pa::PortAudio::new()?;
 
     let device = pa.default_output_device()?;
@@ -329,7 +342,7 @@ fn run(config: Config) -> Result<(), pa::Error> {
 
     let rng = fastrand::Rng::with_seed(777);
     let mut fade_in_scalar = 0.0;
-    let mut now_m = None;
+    let mut started_at = None;
 
     let mut left_pink = init_pink_noise(12);
     let mut right_pink = init_pink_noise(16);
@@ -337,35 +350,60 @@ fn run(config: Config) -> Result<(), pa::Error> {
     let mut left_brown = init_brown_noise(&rng);
     let mut right_brown = init_brown_noise(&rng);
 
-    let (tx, rx) = mpsc::channel();
+    let mut fade_out_start_at: Option<Instant> = None;
 
-    // TODO: get these from settings file.
-    let mut noise_type: NoiseType = NoiseType::White;
-    let mut volume_level: VolumeLevel = VolumeLevel::Max;
+    let mut noise_type = init_noise_type;
+    let mut volume_level = init_volume_level;
+    let mut stream_state = StreamState::Starting;
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
-        if fade_in_scalar < 1.0 {
-            // there is a bug in the portaudio alsa api that makes
-            // the `time` argument empty, so we use the system clock
-            // https://github.com/PortAudio/portaudio/issues/498
-            let now = now_m.get_or_insert(Instant::now());
-            let elapsed = now.elapsed();
-            let delta = elapsed.as_secs_f32();
-
-            fade_in_scalar = ((delta / FADE_IN_SECONDS) + 1.0).log2().min(1.0);
-        }
-
         for m in rx.try_iter() {
             match m {
-                Message::SetNoiseType(nt) => noise_type = nt,
-                Message::NextNoiseType => noise_type = NoiseType::succ(noise_type),
-                Message::SetVolume(v) => volume_level = v,
-                Message::IncVolume => volume_level = VolumeLevel::succ(volume_level),
-                Message::DecVolume => volume_level = VolumeLevel::pred(volume_level),
+                StreamMessage::Start(nt, l) => {
+                    stream_state = StreamState::Starting;
+                    noise_type = nt;
+                    volume_level = l;
+                    started_at = None;
+                    fade_out_start_at = None;
+                    fade_in_scalar = 0.0;
+                },
+                StreamMessage::Stop => {
+                    stream_state = StreamState::Stopping;
+                    fade_out_start_at = Some(Instant::now());
+                },
+                StreamMessage::SetNoiseType(nt) => noise_type = nt,
+                StreamMessage::SetVolume(v) => volume_level = v,
             }
         }
 
-        let final_scalar = fade_in_scalar * VolumeLevel::to_amp_scalar(volume_level);
+        if stream_state == StreamState::Stopped {
+            return pa::Complete;
+        }
+
+        if stream_state == StreamState::Starting {
+            // there is a bug in the portaudio alsa api that makes
+            // the `time` argument empty, so we use the system clock
+            // https://github.com/PortAudio/portaudio/issues/498
+            let now = started_at.get_or_insert(Instant::now());
+            let elapsed = now.elapsed();
+            let delta = elapsed.as_secs_f32();
+
+            fade_in_scalar = ((delta / FADE_IN_SECS) + 1.0).log2().min(1.0);
+
+            if fade_in_scalar >= 1f32 {
+                fade_in_scalar = 1f32;
+                stream_state = StreamState::Running;
+            }
+        }
+
+        let mut fade_out_scalar = fade_out_start_at.map_or(1f32, |x| (FADE_OUT_SECS - x.elapsed().as_secs_f32()) / FADE_OUT_SECS);
+
+        if fade_out_scalar <= 0f32 {
+            fade_out_scalar = 0f32;
+            stream_state = StreamState::Stopped;
+        }
+
+        let final_scalar = fade_in_scalar * VolumeLevel::to_amp_scalar(volume_level) * fade_out_scalar;
 
         match noise_type {
             NoiseType::White => {
@@ -397,9 +435,11 @@ fn run(config: Config) -> Result<(), pa::Error> {
         pa::Continue
     };
 
-    let mut stream = pa.open_non_blocking_stream(settings, callback)?;
+    pa.open_non_blocking_stream(settings, callback)
+}
 
-    stream.start()?;
+fn run(config: Config) -> Result<(), pa::Error> {
+    let (tx, rx) = mpsc::channel();
 
     let mut cleanup_gpio = None;
 
@@ -408,35 +448,130 @@ fn run(config: Config) -> Result<(), pa::Error> {
         false => (),
     };
 
-    println!("generating noise. enter commands or type 'quit' to quit.");
+    println!("noise machine running. enter commands or type 'quit' to quit.");
 
-    loop {
-        let mut input = String::new();
+    std::thread::spawn(move || {
+        loop {
+            let mut input = String::new();
 
-        io::stdin().read_line(&mut input).unwrap();
+            io::stdin().read_line(&mut input).unwrap();
 
-        let msg = match input.trim() {
-            "white" => Right(Message::SetNoiseType(NoiseType::White)),
-            "pink" => Right(Message::SetNoiseType(NoiseType::Pink)),
-            "brown" => Right(Message::SetNoiseType(NoiseType::Brown)),
-            "next" => Right(Message::NextNoiseType),
-            "up" => Right(Message::IncVolume),
-            "down" => Right(Message::DecVolume),
-            "vmax" => Right(Message::SetVolume(VolumeLevel::Max)),
-            "vmin" => Right(Message::SetVolume(VolumeLevel::Mute)),
-            "" | "exit" | "quit" => Left(None),
-            inp => Left(Some(inp)),
-        };
+            let msg = match input.trim() {
+                "toggle" | "start" | "stop" => Right(Message::PowerPushed),
+                "white" => Right(Message::SetNoiseType(NoiseType::White)),
+                "pink" => Right(Message::SetNoiseType(NoiseType::Pink)),
+                "brown" => Right(Message::SetNoiseType(NoiseType::Brown)),
+                "next" => Right(Message::NextNoiseType),
+                "up" => Right(Message::IncVolume),
+                "down" => Right(Message::DecVolume),
+                "vmax" => Right(Message::SetVolume(VolumeLevel::Max)),
+                "vmin" => Right(Message::SetVolume(VolumeLevel::_1)),
+                "" | "exit" | "quit" => Right(Message::PowerHeld),
+                inp => Left(inp),
+            };
 
-        match msg {
-            Right(cmd) => tx.send(cmd).unwrap(),
-            Left(Some(inp)) => println!("invalid input: {}", inp),
-            Left(None) => break,
-        };
+            match msg {
+                Right(cmd) => tx.send(cmd).unwrap(),
+                Left(inp) => println!("invalid input: {}", inp),
+            };
+        }
+    });
+
+    // TODO: read these from a settings file.
+    let mut noise_type: NoiseType = NoiseType::White;
+    let mut volume_level: VolumeLevel = VolumeLevel::_5;
+
+    let (stream_tx, stream_rx) = mpsc::channel();
+    let mut stream = setup_stream(stream_rx, noise_type, volume_level).unwrap();
+
+    'main_loop: loop {
+        for m in rx.iter() {
+            match m {
+                Message::PowerPushed => {
+                    if !stream.is_active().unwrap() {
+                        stream_tx.send(StreamMessage::Start(noise_type, volume_level)).unwrap();
+
+                        match stream.start() {
+                            Ok(_) => {},
+                            // if for some reason the stream was not stopped then
+                            // stop it and start it again (this can happen if the
+                            // power button is tapped twice really quickly).
+                            Err(pa::Error::StreamIsNotStopped) => {
+                                stream.stop().unwrap();
+
+                                stream_tx.send(StreamMessage::Start(noise_type, volume_level)).unwrap();
+                                stream.start().unwrap();
+                            },
+                            _ => {}
+                        }
+                    } else {
+                        stream_tx.send(StreamMessage::Stop).unwrap();
+
+                        // let the stream fade out and then stop it.
+                        while let true = stream.is_active().unwrap() {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+
+                        stream.stop().unwrap();
+
+                        // drain any messages that came in whilst waiting for
+                        // the stream to stop.
+                        let _ = rx.try_recv();
+                    }
+                },
+                Message::PowerHeld => {
+                    // gracefully end the stream if it is running
+                    if stream.is_active().unwrap() {
+                        stream_tx.send(StreamMessage::Stop).unwrap();
+
+                        // let the stream fade out and then stop it.
+                        while let true = stream.is_active().unwrap() {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+
+                        stream.stop().unwrap();
+
+                        // drain any messages that came in whilst waiting for
+                        // the stream to stop.
+                        let _ = rx.try_recv();
+                    }
+
+                    if config.perform_shutdown {
+                        println!("shutting down pi");
+
+                        let output = Command::new("shutdown")
+                            .args(&["-h", "now"])
+                            .output()
+                            .expect("Failed to shutdown pi");
+
+                        println!("{:?}", output);
+                    }
+
+                    break 'main_loop
+                },
+                Message::SetNoiseType(nt) => {
+                    noise_type = nt;
+                    stream_tx.send(StreamMessage::SetNoiseType(noise_type)).unwrap();
+                },
+                Message::NextNoiseType => {
+                    noise_type = NoiseType::succ(noise_type);
+                    stream_tx.send(StreamMessage::SetNoiseType(noise_type)).unwrap();
+                },
+                Message::SetVolume(v) =>  {
+                    volume_level = v;
+                    stream_tx.send(StreamMessage::SetVolume(volume_level)).unwrap();
+                },
+                Message::IncVolume => {
+                    volume_level = VolumeLevel::succ(volume_level);
+                    stream_tx.send(StreamMessage::SetVolume(volume_level)).unwrap();
+                },
+                Message::DecVolume => {
+                    volume_level = VolumeLevel::pred(volume_level);
+                    stream_tx.send(StreamMessage::SetVolume(volume_level)).unwrap();
+                },
+            }
+        }
     }
-
-    stream.stop()?;
-    stream.close()?;
 
     cleanup_gpio.map(|x| x());
 
